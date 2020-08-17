@@ -17,12 +17,14 @@ package api
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1beta1 "k8s.io/apimachinery/pkg/apis/meta/v1beta1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -47,6 +49,7 @@ var _ rest.KindProvider = &podMetrics{}
 var _ rest.Storage = &podMetrics{}
 var _ rest.Getter = &podMetrics{}
 var _ rest.Lister = &podMetrics{}
+var _ rest.TableConvertor = &podMetrics{}
 
 func newPodMetrics(groupResource schema.GroupResource, metrics PodMetricsGetter, podLister v1listers.PodLister) *podMetrics {
 	return &podMetrics{
@@ -88,13 +91,28 @@ func (m *podMetrics) List(ctx context.Context, options *metainternalversion.List
 
 	// currently the PodLister API does not support filtering using FieldSelectors, we have to filter manually
 	if options != nil && options.FieldSelector != nil {
-		for i := len(pods) - 1; i >= 0; i-- {
-			fieldsSet := generic.AddObjectMetaFieldsSet(make(fields.Set, 2), &pods[i].ObjectMeta, true)
-			if !options.FieldSelector.Matches(fieldsSet) {
-				pods = append(pods[:i], pods[i+1:]...)
+		newPods := make([]*v1.Pod, 0, len(pods))
+		fields := make(fields.Set, 2)
+		for _, pod := range pods {
+			for k := range fields {
+				delete(fields, k)
 			}
+			fieldsSet := generic.AddObjectMetaFieldsSet(fields, &pod.ObjectMeta, true)
+			if !options.FieldSelector.Matches(fieldsSet) {
+				continue
+			}
+			newPods = append(newPods, pod)
 		}
+		pods = newPods
 	}
+
+	// maintain the same ordering invariant as the Kube API would over pods
+	sort.Slice(pods, func(i, j int) bool {
+		if pods[i].Namespace != pods[j].Namespace {
+			return pods[i].Namespace < pods[j].Namespace
+		}
+		return pods[i].Name < pods[j].Name
+	})
 
 	metricsItems, err := m.getPodMetrics(pods...)
 	if err != nil {
@@ -135,6 +153,75 @@ func (m *podMetrics) Get(ctx context.Context, name string, opts *metav1.GetOptio
 	return &podMetrics[0], nil
 }
 
+func (m *podMetrics) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1beta1.Table, error) {
+	var table metav1beta1.Table
+
+	switch t := object.(type) {
+	case *metrics.PodMetrics:
+		table.ResourceVersion = t.ResourceVersion
+		table.SelfLink = t.SelfLink
+		addPodMetricsToTable(&table, *t)
+	case *metrics.PodMetricsList:
+		table.ResourceVersion = t.ResourceVersion
+		table.SelfLink = t.SelfLink
+		table.Continue = t.Continue
+		addPodMetricsToTable(&table, t.Items...)
+	default:
+	}
+
+	return &table, nil
+}
+
+func addPodMetricsToTable(table *metav1beta1.Table, pods ...metrics.PodMetrics) {
+	usage := make(v1.ResourceList, 3)
+	var names []string
+	for i, pod := range pods {
+		for k := range usage {
+			delete(usage, k)
+		}
+		for _, container := range pod.Containers {
+			for k, v := range container.Usage {
+				u := usage[k]
+				u.Add(v)
+				usage[k] = u
+			}
+		}
+		if names == nil {
+			for k := range usage {
+				names = append(names, string(k))
+			}
+			sort.Strings(names)
+
+			table.ColumnDefinitions = []metav1beta1.TableColumnDefinition{
+				{Name: "Name", Type: "string", Format: "name", Description: "Name of the resource"},
+			}
+			for _, name := range names {
+				table.ColumnDefinitions = append(table.ColumnDefinitions, metav1beta1.TableColumnDefinition{
+					Name:   name,
+					Type:   "string",
+					Format: "quantity",
+				})
+			}
+			table.ColumnDefinitions = append(table.ColumnDefinitions, metav1beta1.TableColumnDefinition{
+				Name:   "Window",
+				Type:   "string",
+				Format: "duration",
+			})
+		}
+		row := make([]interface{}, 0, len(names)+1)
+		row = append(row, pod.Name)
+		for _, name := range names {
+			v := usage[v1.ResourceName(name)]
+			row = append(row, v.String())
+		}
+		row = append(row, pod.Window.Duration.String())
+		table.Rows = append(table.Rows, metav1beta1.TableRow{
+			Cells:  row,
+			Object: runtime.RawExtension{Object: &pods[i]},
+		})
+	}
+}
+
 func (m *podMetrics) getPodMetrics(pods ...*v1.Pod) ([]metrics.PodMetrics, error) {
 	namespacedNames := make([]apitypes.NamespacedName, len(pods))
 	for i, pod := range pods {
@@ -143,11 +230,7 @@ func (m *podMetrics) getPodMetrics(pods ...*v1.Pod) ([]metrics.PodMetrics, error
 			Namespace: pod.Namespace,
 		}
 	}
-	timestamps, containerMetrics, err := m.metrics.GetContainerMetrics(namespacedNames...)
-	if err != nil {
-		return nil, err
-	}
-
+	timestamps, containerMetrics := m.metrics.GetContainerMetrics(namespacedNames...)
 	res := make([]metrics.PodMetrics, 0, len(pods))
 
 	for i, pod := range pods {
@@ -156,7 +239,6 @@ func (m *podMetrics) getPodMetrics(pods ...*v1.Pod) ([]metrics.PodMetrics, error
 			continue
 		}
 		if containerMetrics[i] == nil {
-			klog.Errorf("unable to fetch pod metrics for pod %s/%s: no metrics known for pod", pod.Namespace, pod.Name)
 			continue
 		}
 

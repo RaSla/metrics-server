@@ -50,10 +50,13 @@ type Options struct {
 
 	MetricResolution time.Duration
 
+	KubeletUseNodeStatusPort     bool
 	KubeletPort                  int
 	InsecureKubeletTLS           bool
 	KubeletPreferredAddressTypes []string
 	KubeletCAFile                string
+	KubeletClientKeyFile         string
+	KubeletClientCertFile        string
 
 	ShowVersion bool
 
@@ -66,10 +69,13 @@ func (o *Options) Flags(cmd *cobra.Command) {
 
 	flags.BoolVar(&o.InsecureKubeletTLS, "kubelet-insecure-tls", o.InsecureKubeletTLS, "Do not verify CA of serving certificates presented by Kubelets.  For testing purposes only.")
 	flags.BoolVar(&o.DeprecatedCompletelyInsecureKubelet, "deprecated-kubelet-completely-insecure", o.DeprecatedCompletelyInsecureKubelet, "Do not use any encryption, authorization, or authentication when communicating with the Kubelet.")
+	flags.BoolVar(&o.KubeletUseNodeStatusPort, "kubelet-use-node-status-port", o.KubeletUseNodeStatusPort, "Use the port in the node status. Takes precedence over --kubelet-port flag.")
 	flags.IntVar(&o.KubeletPort, "kubelet-port", o.KubeletPort, "The port to use to connect to Kubelets.")
 	flags.StringVar(&o.Kubeconfig, "kubeconfig", o.Kubeconfig, "The path to the kubeconfig used to connect to the Kubernetes API server and the Kubelets (defaults to in-cluster config)")
 	flags.StringSliceVar(&o.KubeletPreferredAddressTypes, "kubelet-preferred-address-types", o.KubeletPreferredAddressTypes, "The priority of node address types to use when determining which address to use to connect to a particular node")
 	flags.StringVar(&o.KubeletCAFile, "kubelet-certificate-authority", "", "Path to the CA to use to validate the Kubelet's serving certificates.")
+	flags.StringVar(&o.KubeletClientKeyFile, "kubelet-client-key", "", "Path to a client key file for TLS.")
+	flags.StringVar(&o.KubeletClientCertFile, "kubelet-client-certificate", "", "Path to a client cert file for TLS.")
 
 	flags.BoolVar(&o.ShowVersion, "version", false, "Show version")
 
@@ -110,13 +116,10 @@ func (o Options) MetricsServerConfig() (*metric_server.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	kubelet := o.kubeletConfig(restConfig)
-	addressResolver := o.addressResolverConfig()
 	return &metric_server.Config{
 		Apiserver:        apiserver,
 		Rest:             restConfig,
-		Kubelet:          kubelet,
-		AddresResolver:   addressResolver,
+		Kubelet:          o.kubeletConfig(restConfig),
 		MetricResolution: o.MetricResolution,
 		ScrapeTimeout:    time.Duration(float64(o.MetricResolution) * 0.90), // scrape timeout is 90% of the scrape interval
 	}, nil
@@ -167,12 +170,37 @@ func (o Options) restConfig() (*rest.Config, error) {
 }
 
 func (o Options) kubeletConfig(restConfig *rest.Config) *scraper.KubeletClientConfig {
-	kubeletRestCfg := rest.CopyConfig(restConfig)
-	if len(o.KubeletCAFile) > 0 {
-		kubeletRestCfg.TLSClientConfig.CAFile = o.KubeletCAFile
-		kubeletRestCfg.TLSClientConfig.CAData = nil
+	config := &scraper.KubeletClientConfig{
+		DefaultPort:         o.KubeletPort,
+		AddressTypePriority: o.addressResolverConfig(),
+		UseNodeStatusPort:   o.KubeletUseNodeStatusPort,
 	}
-	return scraper.GetKubeletConfig(kubeletRestCfg, o.KubeletPort, o.InsecureKubeletTLS, o.DeprecatedCompletelyInsecureKubelet)
+	if len(o.KubeletCAFile) > 0 {
+		config.Client.TLSClientConfig.CAFile = o.KubeletCAFile
+		config.Client.TLSClientConfig.CAData = nil
+	}
+	if len(o.KubeletClientCertFile) > 0 {
+		config.Client.TLSClientConfig.CertFile = o.KubeletClientCertFile
+		config.Client.TLSClientConfig.CertData = nil
+	}
+	if len(o.KubeletClientKeyFile) > 0 {
+		config.Client.TLSClientConfig.KeyFile = o.KubeletClientKeyFile
+		config.Client.TLSClientConfig.KeyData = nil
+	}
+	if o.DeprecatedCompletelyInsecureKubelet {
+		config.Scheme = "http"
+		config.Client = *rest.AnonymousClientConfig(&config.Client) // don't use auth to avoid leaking auth details to insecure endpoints
+		config.Client.TLSClientConfig = rest.TLSClientConfig{}      // empty TLS config --> no TLS
+	} else {
+		config.Scheme = "https"
+		config.Client = *rest.CopyConfig(restConfig)
+	}
+	if o.InsecureKubeletTLS {
+		config.Client.TLSClientConfig.Insecure = true
+		config.Client.TLSClientConfig.CAData = nil
+		config.Client.TLSClientConfig.CAFile = ""
+	}
+	return config
 }
 
 func (o Options) addressResolverConfig() []corev1.NodeAddressType {

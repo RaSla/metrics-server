@@ -1,10 +1,4 @@
 ---
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: metrics-server
-  namespace: kube-system
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,6 +10,9 @@ spec:
   selector:
     matchLabels:
       k8s-app: metrics-server
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
   template:
     metadata:
       name: metrics-server
@@ -27,17 +24,25 @@ spec:
       # mount in tmp so we can safely use from-scratch images and/or read-only containers
       - name: tmp-dir
         emptyDir: {}
+      priorityClassName: system-cluster-critical
       containers:
       - name: metrics-server
-        image: k8s.gcr.io/metrics-server-amd64:v0.3.6
+        image: gcr.io/k8s-staging-metrics-server/metrics-server:master
         imagePullPolicy: IfNotPresent
         args:
           - --cert-dir=/tmp
           - --secure-port=4443
+          - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
+          - --kubelet-use-node-status-port
         ports:
-        - name: main-port
+        - name: https
           containerPort: 4443
           protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: https
+            scheme: HTTPS
         securityContext:
           readOnlyRootFilesystem: true
           runAsNonRoot: true
@@ -47,4 +52,3 @@ spec:
           mountPath: /tmp
       nodeSelector:
         kubernetes.io/os: linux
-        kubernetes.io/arch: "amd64"

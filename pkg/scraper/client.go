@@ -15,30 +15,39 @@
 package scraper
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 
-	"k8s.io/klog"
-	stats "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
+	"github.com/mailru/easyjson"
+
+	corev1 "k8s.io/api/core/v1"
+
+	"sigs.k8s.io/metrics-server/pkg/utils"
 )
 
 // KubeletInterface knows how to fetch metrics from the Kubelet
 type KubeletInterface interface {
 	// GetSummary fetches summary metrics from the given Kubelet
-	GetSummary(ctx context.Context, host string) (*stats.Summary, error)
+	GetSummary(ctx context.Context, node *corev1.Node) (*Summary, error)
 }
 
 type kubeletClient struct {
-	port            int
-	deprecatedNoTLS bool
-	client          *http.Client
+	defaultPort       int
+	useNodeStatusPort bool
+	client            *http.Client
+	scheme            string
+	addrResolver      utils.NodeAddressResolver
+	buffers           sync.Pool
 }
+
+var _ KubeletInterface = (*kubeletClient)(nil)
 
 type ErrNotFound struct {
 	endpoint string
@@ -48,49 +57,46 @@ func (err *ErrNotFound) Error() string {
 	return fmt.Sprintf("%q not found", err.endpoint)
 }
 
-func IsNotFoundError(err error) bool {
-	_, isNotFound := err.(*ErrNotFound)
-	return isNotFound
-}
-
-func (kc *kubeletClient) makeRequestAndGetValue(client *http.Client, req *http.Request, value interface{}) error {
+func (kc *kubeletClient) makeRequestAndGetValue(client *http.Client, req *http.Request, value easyjson.Unmarshaler) error {
 	// TODO(directxman12): support validating certs by hostname
 	response, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
-	body, err := ioutil.ReadAll(response.Body)
+	b := kc.getBuffer()
+	defer kc.returnBuffer(b)
+	_, err = io.Copy(b, response.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read response body - %v", err)
+		return err
 	}
+	body := b.Bytes()
 	if response.StatusCode == http.StatusNotFound {
 		return &ErrNotFound{req.URL.String()}
 	} else if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("request failed - %q, response: %q", response.Status, string(body))
+		return fmt.Errorf("request failed - %q.", response.Status)
 	}
 
-	kubeletAddr := "[unknown]"
-	if req.URL != nil {
-		kubeletAddr = req.URL.Host
-	}
-	klog.V(10).Infof("Raw response from Kubelet at %s: %s", kubeletAddr, string(body))
-
-	err = json.Unmarshal(body, value)
+	err = easyjson.Unmarshal(body, value)
 	if err != nil {
-		return fmt.Errorf("failed to parse output. Response: %q. Error: %v", string(body), err)
+		return fmt.Errorf("failed to parse output. Error: %v", err)
 	}
 	return nil
 }
 
-func (kc *kubeletClient) GetSummary(ctx context.Context, host string) (*stats.Summary, error) {
-	scheme := "https"
-	if kc.deprecatedNoTLS {
-		scheme = "http"
+func (kc *kubeletClient) GetSummary(ctx context.Context, node *corev1.Node) (*Summary, error) {
+	port := kc.defaultPort
+	nodeStatusPort := int(node.Status.DaemonEndpoints.KubeletEndpoint.Port)
+	if kc.useNodeStatusPort && nodeStatusPort != 0 {
+		port = nodeStatusPort
+	}
+	addr, err := kc.addrResolver.NodeAddress(node)
+	if err != nil {
+		return nil, fmt.Errorf("unable to extract connection information for node %q: %v", node.Name, err)
 	}
 	url := url.URL{
-		Scheme:   scheme,
-		Host:     net.JoinHostPort(host, strconv.Itoa(kc.port)),
+		Scheme:   kc.scheme,
+		Host:     net.JoinHostPort(addr, strconv.Itoa(port)),
 		Path:     "/stats/summary",
 		RawQuery: "only_cpu_and_memory=true",
 	}
@@ -99,7 +105,7 @@ func (kc *kubeletClient) GetSummary(ctx context.Context, host string) (*stats.Su
 	if err != nil {
 		return nil, err
 	}
-	summary := &stats.Summary{}
+	summary := &Summary{}
 	client := kc.client
 	if client == nil {
 		client = http.DefaultClient
@@ -108,13 +114,11 @@ func (kc *kubeletClient) GetSummary(ctx context.Context, host string) (*stats.Su
 	return summary, err
 }
 
-func NewKubeletClient(transport http.RoundTripper, port int, deprecatedNoTLS bool) (KubeletInterface, error) {
-	c := &http.Client{
-		Transport: transport,
-	}
-	return &kubeletClient{
-		port:            port,
-		client:          c,
-		deprecatedNoTLS: deprecatedNoTLS,
-	}, nil
+func (kc *kubeletClient) getBuffer() *bytes.Buffer {
+	return kc.buffers.Get().(*bytes.Buffer)
+}
+
+func (kc *kubeletClient) returnBuffer(b *bytes.Buffer) {
+	b.Reset()
+	kc.buffers.Put(b)
 }

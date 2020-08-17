@@ -21,10 +21,11 @@ import (
 	"sync"
 	"time"
 
+	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
-
-	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/klog"
 
 	"sigs.k8s.io/metrics-server/pkg/scraper"
@@ -58,6 +59,9 @@ func RegisterServerMetrics(resolution time.Duration) {
 type MetricsServer struct {
 	*genericapiserver.GenericAPIServer
 
+	syncs    []cache.InformerSynced
+	informer informers.SharedInformerFactory
+
 	storage    *storage.Storage
 	scraper    *scraper.Scraper
 	resolution time.Duration
@@ -69,31 +73,40 @@ type MetricsServer struct {
 
 // RunUntil starts background scraping goroutine and runs apiserver serving metrics.
 func (ms *MetricsServer) RunUntil(stopCh <-chan struct{}) error {
-	go func() {
-		ticker := time.NewTicker(ms.resolution)
-		defer ticker.Stop()
-		ms.scrape(time.Now())
-
-		for {
-			select {
-			case startTime := <-ticker.C:
-				ms.scrape(startTime)
-			case <-stopCh:
-				return
-			}
-		}
-	}()
+	ms.informer.Start(stopCh)
+	shutdown := cache.WaitForCacheSync(stopCh, ms.syncs...)
+	if !shutdown {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go ms.runScrape(ctx)
 	return ms.GenericAPIServer.PrepareRun().Run(stopCh)
 }
 
-func (ms *MetricsServer) scrape(startTime time.Time) {
+func (ms *MetricsServer) runScrape(ctx context.Context) {
+	ticker := time.NewTicker(ms.resolution)
+	defer ticker.Stop()
+	ms.scrape(ctx, time.Now())
+
+	for {
+		select {
+		case startTime := <-ticker.C:
+			ms.scrape(ctx, startTime)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (ms *MetricsServer) scrape(ctx context.Context, startTime time.Time) {
 	ms.healthMu.Lock()
 	ms.lastTickStart = startTime
 	ms.healthMu.Unlock()
 
 	healthyTick := true
 
-	ctx, cancelTimeout := context.WithTimeout(context.Background(), ms.resolution)
+	ctx, cancelTimeout := context.WithTimeout(ctx, ms.resolution)
 	defer cancelTimeout()
 
 	klog.V(6).Infof("Beginning cycle, scraping metrics...")
